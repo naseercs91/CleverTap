@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: event-ingestion
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      steps:
+      - setWeight: 10
+      - pause: {duration: 5m}
+      - setWeight: 50
+      - pause: {duration: 10m}
+      - setWeight: 100
+      analysis:
+        templates:
+        - templateName: error-rate-template
+        args:
+        - name: service-name
+          value: event-ingestion
+      rollback:
+        steps:
+        - setWeight: 0

@@ -1,0 +1,78 @@
+name: Build & Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches: [main]
+
+env:
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO: event-ingestion
+  CLUSTER_NAME: staging-eks
+
+jobs:
+  pr-checks:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build container image
+        run: docker build -t $ECR_REGISTRY/$ECR_REPO:${{ github.sha }} .
+
+      - name: SAST scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push to ECR (on PR, still push for testing)
+        run: |
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+          docker push $ECR_REGISTRY/$ECR_REPO:${{ github.sha }}
+
+  staging-deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${secrets.AWS_ACCOUNT_ID}:role/gha-staging-role
+          aws-region: us-east-1
+
+      - name: Build & push final image
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPO:${GITHUB_SHA} .
+          docker push $ECR_REGISTRY/$ECR_REPO:${GITHUB_SHA}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+
+      - name: Deploy to staging with Helm
+        run: |
+          helm upgrade --install event-ingestion ./helm/event-ingestion \
+            --namespace staging --create-namespace \
+            --set image.tag=${GITHUB_SHA} \
+            --set secretsManager.enabled=true
+
+      - name: Smoke tests
+        run: |
+          kubectl wait --for=condition=ready pod -l app=event-ingestion -n staging --timeout=120s
+          ./scripts/smoke-test.sh staging
+
+      - name: Manual approval (GitHub environment protection rule)
